@@ -1182,7 +1182,27 @@ static async Task<ErrorOr<CommitAnalysis>> GenerateCommitAnalysisAsync(
         if (TryParseCommitAnalysis(content, out var analysis) && analysis is not null)
             return analysis;
 
-        return Error.Failure(description: "Could not parse analysis JSON from model response.");
+        var repairPrompt = new StringBuilder();
+        repairPrompt.AppendLine("Your previous output was not valid for parsing.");
+        repairPrompt.AppendLine("Return ONLY JSON with keys: intent, scope, risks, suggestedActions, ticketHint.");
+        if (!string.IsNullOrWhiteSpace(content))
+        {
+            repairPrompt.AppendLine("Previous output:");
+            repairPrompt.AppendLine(content);
+        }
+
+        var repairResponse = await session.SendAndWaitAsync(new MessageOptions
+        {
+            Prompt = repairPrompt.ToString()
+        }, timeout: requestTimeout);
+
+        var repairContent = repairResponse?.Data?.Content;
+        if (TryParseCommitAnalysis(repairContent, out var repairedAnalysis) && repairedAnalysis is not null)
+            return repairedAnalysis;
+
+        var fallbackAnalysis = CreateFallbackCommitAnalysisFromText(content ?? repairContent, branch);
+        WriteWarning("Analysis response was not strict JSON; using fallback analysis.");
+        return fallbackAnalysis;
     }
     catch (OperationCanceledException)
     {
@@ -1373,16 +1393,43 @@ static bool TryParseCommitAnalysis(string? raw, out CommitAnalysis? analysis)
         var suggestedActions = root.TryGetProperty("suggestedActions", out var actionsElement) ? actionsElement.GetString() : null;
         var ticketHint = root.TryGetProperty("ticketHint", out var ticketElement) ? ticketElement.GetString() : null;
 
-        if (string.IsNullOrWhiteSpace(intent) || string.IsNullOrWhiteSpace(scope) || string.IsNullOrWhiteSpace(risks))
+        if (string.IsNullOrWhiteSpace(intent))
             return false;
 
-        analysis = new CommitAnalysis(intent.Trim(), scope.Trim(), risks.Trim(), (suggestedActions ?? string.Empty).Trim(), ticketHint?.Trim());
+        var normalizedScope = string.IsNullOrWhiteSpace(scope) ? "general" : scope.Trim();
+        var normalizedRisks = string.IsNullOrWhiteSpace(risks) ? "Risk details not provided" : risks.Trim();
+        analysis = new CommitAnalysis(intent.Trim(), normalizedScope, normalizedRisks, (suggestedActions ?? string.Empty).Trim(), ticketHint?.Trim());
         return true;
     }
     catch
     {
         return false;
     }
+}
+
+static CommitAnalysis CreateFallbackCommitAnalysisFromText(string? raw, string branch)
+{
+    var normalized = (raw ?? string.Empty).Trim();
+    if (string.IsNullOrWhiteSpace(normalized))
+    {
+        return new CommitAnalysis(
+            "Summarize and commit current changes",
+            branch,
+            "Risk level unknown (analysis fallback)",
+            string.Empty,
+            null);
+    }
+
+    var firstLine = normalized
+        .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .FirstOrDefault();
+
+    return new CommitAnalysis(
+        string.IsNullOrWhiteSpace(firstLine) ? "Summarize and commit current changes" : firstLine,
+        branch,
+        "Risk details unavailable (analysis fallback)",
+        string.Empty,
+        null);
 }
 
 static bool TryParseCommitSchema(string? raw, GitToolConfig gitConfig, out CommitSchema? schema)
