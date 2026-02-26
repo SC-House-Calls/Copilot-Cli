@@ -244,6 +244,13 @@ static void WriteWarning(string message) => AnsiConsole.MarkupLine($"[yellow]{Ma
 static void WriteError(string message) => AnsiConsole.MarkupLine($"[red]{Markup.Escape(message)}[/]");
 static void WriteSuccess(string message) => AnsiConsole.MarkupLine($"[green]{Markup.Escape(message)}[/]");
 
+static string ResolveConfiguredFilePath(string? configuredPath, string fallback)
+{
+    return string.IsNullOrWhiteSpace(configuredPath)
+        ? fallback
+        : configuredPath.Trim();
+}
+
 static async Task<T?> ReadJsonFileAsync<T>(string filePath, JsonTypeInfo<T> jsonTypeInfo, CancellationToken cancellationToken)
 {
     await using var readStream = new FileStream(
@@ -1088,6 +1095,678 @@ static string ApplyCommitFormatting(string raw, GitToolConfig gitConfig, string 
     return message;
 }
 
+static CommitRequestOptions ParseCommitOptions(string argText)
+{
+    var tokens = SplitArguments(argText);
+    var quality = "fast";
+
+    for (var index = 0; index < tokens.Count; index++)
+    {
+        var token = tokens[index];
+        if (!string.Equals(token, "--quality", StringComparison.OrdinalIgnoreCase))
+            continue;
+
+        if (index + 1 < tokens.Count)
+            quality = tokens[index + 1];
+    }
+
+    quality = quality.Trim().ToLowerInvariant();
+    return quality switch
+    {
+        "high" => new CommitRequestOptions("high"),
+        _ => new CommitRequestOptions("fast"),
+    };
+}
+
+static async Task<ErrorOr<CommitAnalysis>> GenerateCommitAnalysisAsync(
+    CopilotSession session,
+    ProviderProfile profile,
+    string status,
+    string diff,
+    string? styleHint,
+    string branch,
+    AttachedContext? attachedContext,
+    bool amend,
+    CommitRequestOptions commitOptions,
+    BranchMemoryEntry? branchMemory,
+    bool isDiffTruncated,
+    TimeSpan requestTimeout)
+{
+    var promptBuilder = new StringBuilder();
+    promptBuilder.AppendLine("Analyze the repository changes for commit preparation.");
+    promptBuilder.AppendLine("Return ONLY JSON with keys: intent, scope, risks, suggestedActions, ticketHint.");
+    promptBuilder.AppendLine($"Operation: {(amend ? "amend" : "new commit")}");
+    promptBuilder.AppendLine($"Branch: {branch}");
+    promptBuilder.AppendLine($"Quality mode: {commitOptions.Quality}");
+
+    if (!string.IsNullOrWhiteSpace(styleHint))
+    {
+        promptBuilder.AppendLine("User style hint:");
+        promptBuilder.AppendLine(styleHint);
+    }
+
+    if (branchMemory is not null)
+    {
+        promptBuilder.AppendLine($"Historical branch style hint: {branchMemory.PreferredStyleHint}");
+        promptBuilder.AppendLine($"Historical commit type: {branchMemory.LastCommitType}");
+        promptBuilder.AppendLine($"Historical commit scope: {branchMemory.LastCommitScope}");
+    }
+
+    if (isDiffTruncated)
+    {
+        promptBuilder.AppendLine("Diff is truncated. If MCP tools are available, pull more context from relevant files or issue systems before finalizing analysis.");
+    }
+
+    if (attachedContext is not null)
+    {
+        promptBuilder.AppendLine();
+        promptBuilder.AppendLine($"Attached context file ({attachedContext.Path}):");
+        promptBuilder.AppendLine(TruncateForPrompt(attachedContext.Content, 8000));
+    }
+
+    promptBuilder.AppendLine();
+    promptBuilder.AppendLine("Git status:");
+    promptBuilder.AppendLine(status);
+    promptBuilder.AppendLine();
+    promptBuilder.AppendLine("Diff:");
+    promptBuilder.AppendLine(diff);
+
+    try
+    {
+        var response = await session.SendAndWaitAsync(new MessageOptions
+        {
+            Prompt = promptBuilder.ToString()
+        }, timeout: requestTimeout);
+
+        var content = response?.Data?.Content;
+        if (TryParseCommitAnalysis(content, out var analysis) && analysis is not null)
+            return analysis;
+
+        return Error.Failure(description: "Could not parse analysis JSON from model response.");
+    }
+    catch (OperationCanceledException)
+    {
+        return Error.Failure(description: "Operation canceled by user.");
+    }
+}
+
+static async Task<ErrorOr<CommitSchema>> GenerateCommitSchemaAsync(
+    CopilotSession session,
+    ProviderProfile profile,
+    string status,
+    string diff,
+    GitToolConfig gitConfig,
+    string? styleHint,
+    string branch,
+    AttachedContext? attachedContext,
+    bool amend,
+    CommitRequestOptions commitOptions,
+    BranchMemoryEntry? branchMemory,
+    CommitAnalysis analysis,
+    bool isDiffTruncated,
+    TimeSpan requestTimeout,
+    CancellationToken cancellationToken)
+{
+    var promptBuilder = new StringBuilder();
+    promptBuilder.AppendLine("Generate a strict JSON commit schema for these changes.");
+    promptBuilder.AppendLine("Return ONLY JSON with keys: type, scope, summary, body, breaking.");
+    promptBuilder.AppendLine("- type: lower-case conventional type (feat, fix, docs, refactor, test, chore, perf, ci, build, style, revert)");
+    promptBuilder.AppendLine("- scope: nullable short scope");
+    promptBuilder.AppendLine("- summary: imperative line, no trailing period, <=72 chars when possible");
+    promptBuilder.AppendLine("- body: nullable multiline details");
+    promptBuilder.AppendLine("- breaking: boolean");
+    promptBuilder.AppendLine($"Default type when uncertain: {gitConfig.DefaultCommitType}");
+    promptBuilder.AppendLine($"Operation: {(amend ? "amend" : "new commit")}");
+    promptBuilder.AppendLine($"Branch: {branch}");
+    promptBuilder.AppendLine($"Quality mode: {commitOptions.Quality}");
+    promptBuilder.AppendLine();
+    promptBuilder.AppendLine("Analysis:");
+    promptBuilder.AppendLine($"intent: {analysis.Intent}");
+    promptBuilder.AppendLine($"scope: {analysis.Scope}");
+    promptBuilder.AppendLine($"risks: {analysis.Risks}");
+    promptBuilder.AppendLine($"suggestedActions: {analysis.SuggestedActions}");
+    promptBuilder.AppendLine($"ticketHint: {analysis.TicketHint}");
+
+    if (!string.IsNullOrWhiteSpace(styleHint))
+    {
+        promptBuilder.AppendLine("User style hint:");
+        promptBuilder.AppendLine(styleHint);
+    }
+
+    if (branchMemory is not null)
+    {
+        promptBuilder.AppendLine($"Historical branch style hint: {branchMemory.PreferredStyleHint}");
+        promptBuilder.AppendLine($"Historical commit type: {branchMemory.LastCommitType}");
+        promptBuilder.AppendLine($"Historical commit scope: {branchMemory.LastCommitScope}");
+    }
+
+    if (isDiffTruncated)
+        promptBuilder.AppendLine("Diff is truncated. If MCP tools are available, pull missing file context before finalizing schema.");
+
+    if (attachedContext is not null)
+    {
+        promptBuilder.AppendLine();
+        promptBuilder.AppendLine($"Attached context file ({attachedContext.Path}):");
+        promptBuilder.AppendLine(TruncateForPrompt(attachedContext.Content, 8000));
+    }
+
+    promptBuilder.AppendLine();
+    promptBuilder.AppendLine("Git status:");
+    promptBuilder.AppendLine(status);
+    promptBuilder.AppendLine();
+    promptBuilder.AppendLine("Diff:");
+    promptBuilder.AppendLine(diff);
+
+    try
+    {
+        var response = await session.SendAndWaitAsync(new MessageOptions
+        {
+            Prompt = promptBuilder.ToString()
+        }, timeout: requestTimeout);
+
+        var content = response?.Data?.Content;
+        if (TryParseCommitSchema(content, gitConfig, out var schema) && schema is not null)
+            return schema;
+
+        var repairPrompt = "Your previous output was invalid. Return ONLY valid JSON with keys: type, scope, summary, body, breaking.";
+        var repair = await session.SendAndWaitAsync(new MessageOptions { Prompt = repairPrompt }, timeout: requestTimeout);
+        var repairContent = repair?.Data?.Content;
+        if (TryParseCommitSchema(repairContent, gitConfig, out var repairedSchema) && repairedSchema is not null)
+            return repairedSchema;
+
+        return Error.Failure(description: "Could not parse commit schema JSON after one repair attempt.");
+    }
+    catch (OperationCanceledException)
+    {
+        return Error.Failure(description: cancellationToken.IsCancellationRequested
+            ? "Operation canceled by user."
+            : "Operation timed out.");
+    }
+}
+
+static string BuildCommitFallbackPrompt(
+    string status,
+    string diff,
+    GitToolConfig gitConfig,
+    string? styleHint,
+    string branch,
+    AttachedContext? attachedContext,
+    bool amend,
+    CommitRequestOptions commitOptions,
+    BranchMemoryEntry? branchMemory,
+    CommitAnalysis? analysis,
+    bool isDiffTruncated)
+{
+    var promptBuilder = new StringBuilder();
+    promptBuilder.AppendLine("Generate a git commit message based on the repository changes.");
+    promptBuilder.AppendLine("Return ONLY the final commit message text with no markdown fences.");
+
+    if (gitConfig.UseConventionalCommits)
+        promptBuilder.AppendLine("Use conventional commit format: type(scope): summary");
+    else
+        promptBuilder.AppendLine("Use a concise imperative commit message.");
+
+    promptBuilder.AppendLine($"Default commit type to use when unclear: {gitConfig.DefaultCommitType}");
+    promptBuilder.AppendLine($"Operation: {(amend ? "amend last commit" : "new commit")}");
+    promptBuilder.AppendLine($"Current branch: {branch}");
+    promptBuilder.AppendLine($"Quality mode: {commitOptions.Quality}");
+
+    if (analysis is not null)
+    {
+        promptBuilder.AppendLine("Analysis summary:");
+        promptBuilder.AppendLine($"intent: {analysis.Intent}");
+        promptBuilder.AppendLine($"scope: {analysis.Scope}");
+        promptBuilder.AppendLine($"risks: {analysis.Risks}");
+    }
+
+    if (!string.IsNullOrWhiteSpace(styleHint))
+    {
+        promptBuilder.AppendLine("User style hint:");
+        promptBuilder.AppendLine(styleHint);
+    }
+
+    if (branchMemory is not null && !string.IsNullOrWhiteSpace(branchMemory.PreferredStyleHint))
+    {
+        promptBuilder.AppendLine("Historical branch style hint:");
+        promptBuilder.AppendLine(branchMemory.PreferredStyleHint);
+    }
+
+    if (!string.IsNullOrWhiteSpace(gitConfig.CustomTemplate))
+    {
+        promptBuilder.AppendLine("Project commit template requirement:");
+        promptBuilder.AppendLine(gitConfig.CustomTemplate);
+    }
+
+    if (isDiffTruncated)
+        promptBuilder.AppendLine("Diff is truncated. If MCP tools are available, pull additional file context before writing.");
+
+    if (attachedContext is not null)
+    {
+        promptBuilder.AppendLine();
+        promptBuilder.AppendLine($"Attached context file ({attachedContext.Path}):");
+        promptBuilder.AppendLine(TruncateForPrompt(attachedContext.Content, 8000));
+    }
+
+    promptBuilder.AppendLine();
+    promptBuilder.AppendLine("Git status:");
+    promptBuilder.AppendLine(status);
+    promptBuilder.AppendLine();
+    promptBuilder.AppendLine("Diff:");
+    promptBuilder.AppendLine(diff);
+    return promptBuilder.ToString();
+}
+
+static bool TryParseCommitAnalysis(string? raw, out CommitAnalysis? analysis)
+{
+    analysis = null;
+    var payload = ExtractJsonObject(raw);
+    if (string.IsNullOrWhiteSpace(payload))
+        return false;
+
+    try
+    {
+        using var document = JsonDocument.Parse(payload);
+        var root = document.RootElement;
+        var intent = root.TryGetProperty("intent", out var intentElement) ? intentElement.GetString() : null;
+        var scope = root.TryGetProperty("scope", out var scopeElement) ? scopeElement.GetString() : null;
+        var risks = root.TryGetProperty("risks", out var risksElement) ? risksElement.GetString() : null;
+        var suggestedActions = root.TryGetProperty("suggestedActions", out var actionsElement) ? actionsElement.GetString() : null;
+        var ticketHint = root.TryGetProperty("ticketHint", out var ticketElement) ? ticketElement.GetString() : null;
+
+        if (string.IsNullOrWhiteSpace(intent) || string.IsNullOrWhiteSpace(scope) || string.IsNullOrWhiteSpace(risks))
+            return false;
+
+        analysis = new CommitAnalysis(intent.Trim(), scope.Trim(), risks.Trim(), (suggestedActions ?? string.Empty).Trim(), ticketHint?.Trim());
+        return true;
+    }
+    catch
+    {
+        return false;
+    }
+}
+
+static bool TryParseCommitSchema(string? raw, GitToolConfig gitConfig, out CommitSchema? schema)
+{
+    schema = null;
+    var payload = ExtractJsonObject(raw);
+    if (string.IsNullOrWhiteSpace(payload))
+        return false;
+
+    try
+    {
+        using var document = JsonDocument.Parse(payload);
+        var root = document.RootElement;
+        var type = root.TryGetProperty("type", out var typeElement) ? typeElement.GetString() : null;
+        var scope = root.TryGetProperty("scope", out var scopeElement) ? scopeElement.GetString() : null;
+        var summary = root.TryGetProperty("summary", out var summaryElement) ? summaryElement.GetString() : null;
+        var body = root.TryGetProperty("body", out var bodyElement) ? bodyElement.GetString() : null;
+        var breaking = root.TryGetProperty("breaking", out var breakingElement) && breakingElement.ValueKind == JsonValueKind.True;
+
+        if (string.IsNullOrWhiteSpace(summary))
+            return false;
+
+        var normalizedType = string.IsNullOrWhiteSpace(type)
+            ? gitConfig.DefaultCommitType
+            : type.Trim().ToLowerInvariant();
+
+        schema = new CommitSchema(
+            normalizedType,
+            string.IsNullOrWhiteSpace(scope) ? null : scope.Trim(),
+            summary.Trim(),
+            string.IsNullOrWhiteSpace(body) ? null : body.Trim(),
+            breaking);
+
+        return true;
+    }
+    catch
+    {
+        return false;
+    }
+}
+
+static string FormatCommitMessageFromSchema(CommitSchema schema, GitToolConfig gitConfig, string branch)
+{
+    var header = string.IsNullOrWhiteSpace(schema.Scope)
+        ? $"{schema.Type}: {schema.Summary}"
+        : $"{schema.Type}({schema.Scope}): {schema.Summary}";
+
+    if (!schema.BreakingChange)
+    {
+        var message = string.IsNullOrWhiteSpace(schema.Body)
+            ? header
+            : $"{header}\n\n{schema.Body}";
+
+        return ApplyCommitFormatting(message, gitConfig, branch);
+    }
+
+    var breakingLine = "BREAKING CHANGE: behavior may be incompatible with previous versions.";
+    var withBreaking = string.IsNullOrWhiteSpace(schema.Body)
+        ? $"{header}\n\n{breakingLine}"
+        : $"{header}\n\n{schema.Body}\n\n{breakingLine}";
+
+    return ApplyCommitFormatting(withBreaking, gitConfig, branch);
+}
+
+static string ExtractJsonObject(string? raw)
+{
+    if (string.IsNullOrWhiteSpace(raw))
+        return string.Empty;
+
+    var start = raw.IndexOf('{');
+    var end = raw.LastIndexOf('}');
+    if (start < 0 || end <= start)
+        return raw.Trim();
+
+    return raw[start..(end + 1)].Trim();
+}
+
+static string BuildSessionScopeKey(string repoRoot, string branch)
+{
+    var normalizedRoot = Path.GetFullPath(repoRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).ToLowerInvariant();
+    var normalizedBranch = string.IsNullOrWhiteSpace(branch) ? "unknown" : branch.Trim().ToLowerInvariant();
+    return $"{normalizedRoot}|{normalizedBranch}";
+}
+
+static async Task<string> GetCurrentBranchNameAsync(string repoRoot, CancellationToken cancellationToken)
+{
+    var branchResult = await RunGitCommandAsync(repoRoot, cancellationToken, "rev-parse", "--abbrev-ref", "HEAD");
+    if (branchResult.IsError)
+        return "unknown";
+
+    if (branchResult.Value.ExitCode != 0 || string.IsNullOrWhiteSpace(branchResult.Value.StdOut))
+        return "unknown";
+
+    return branchResult.Value.StdOut.Trim();
+}
+
+static async Task<CopilotSession> GetOrCreateScopedSessionAsync(
+    Dictionary<string, CopilotSession> scopedSessions,
+    string sessionScopeKey,
+    CopilotClient client,
+    SessionConfig sessionConfig,
+    CancellationToken cancellationToken)
+{
+    if (scopedSessions.TryGetValue(sessionScopeKey, out var existingSession))
+        return existingSession;
+
+    var created = await client.CreateSessionAsync(sessionConfig, cancellationToken);
+    scopedSessions[sessionScopeKey] = created;
+    return created;
+}
+
+static async Task<BranchMemoryStore> LoadBranchMemoryStoreAsync(string repoRoot, GitToolConfig gitConfig, CancellationToken cancellationToken)
+{
+    var memoryFile = ResolveConfiguredFilePath(gitConfig.BranchMemoryFile, ".gitcopilot-memory.json");
+    var memoryPath = Path.IsPathRooted(memoryFile)
+        ? memoryFile
+        : Path.Combine(repoRoot, memoryFile);
+
+    if (!File.Exists(memoryPath))
+        return new BranchMemoryStore(repoRoot, memoryPath, new Dictionary<string, BranchMemoryEntry>(StringComparer.OrdinalIgnoreCase));
+
+    try
+    {
+        var data = await ReadJsonFileAsync(memoryPath, BranchMemoryFileSerializerContext.Default.BranchMemoryFile, cancellationToken);
+        return new BranchMemoryStore(
+            repoRoot,
+            memoryPath,
+            data?.Entries ?? new Dictionary<string, BranchMemoryEntry>(StringComparer.OrdinalIgnoreCase));
+    }
+    catch
+    {
+        return new BranchMemoryStore(repoRoot, memoryPath, new Dictionary<string, BranchMemoryEntry>(StringComparer.OrdinalIgnoreCase));
+    }
+}
+
+static async Task<ErrorOr<Success>> SaveBranchMemoryStoreAsync(BranchMemoryStore branchMemoryStore, CancellationToken cancellationToken)
+{
+    try
+    {
+        var directory = Path.GetDirectoryName(branchMemoryStore.MemoryFilePath);
+        if (!string.IsNullOrWhiteSpace(directory))
+            Directory.CreateDirectory(directory);
+
+        var payload = new BranchMemoryFile(branchMemoryStore.Entries);
+        await WriteJsonFileAsync(branchMemoryStore.MemoryFilePath, payload, BranchMemoryFileSerializerContext.Default.BranchMemoryFile, cancellationToken);
+        return Result.Success;
+    }
+    catch (Exception ex)
+    {
+        return Error.Failure(description: ex.Message);
+    }
+}
+
+static async Task HandlePrCommandAsync(
+    CopilotSession session,
+    ProviderProfile profile,
+    string repoRoot,
+    GitToolConfig gitConfig,
+    ReplConfig replConfig,
+    string argText,
+    CancellationToken cancellationToken)
+{
+    var statusResult = await RunGitCommandAsync(repoRoot, cancellationToken, "status", "--short", "--branch");
+    if (statusResult.IsError)
+    {
+        WriteError($"PR Error: {statusResult.FirstError.Description}");
+        return;
+    }
+
+    var stagedDiffResult = await RunGitCommandAsync(repoRoot, cancellationToken, "diff", "--cached", "--");
+    if (stagedDiffResult.IsError)
+    {
+        WriteError($"PR Error: {stagedDiffResult.FirstError.Description}");
+        return;
+    }
+
+    var unstagedDiffResult = await RunGitCommandAsync(repoRoot, cancellationToken, "diff", "--");
+    if (unstagedDiffResult.IsError)
+    {
+        WriteError($"PR Error: {unstagedDiffResult.FirstError.Description}");
+        return;
+    }
+
+    var diff = string.IsNullOrWhiteSpace(stagedDiffResult.Value.StdOut)
+        ? unstagedDiffResult.Value.StdOut
+        : stagedDiffResult.Value.StdOut;
+
+    if (string.IsNullOrWhiteSpace(diff))
+    {
+        WriteWarning("No changes available for /pr.");
+        return;
+    }
+
+    var prompt = new StringBuilder();
+    prompt.AppendLine("Create a pull request draft.");
+    prompt.AppendLine("Return markdown with sections: Title, Summary, Checklist, Testing Notes, Risks, Linked Work.");
+    prompt.AppendLine("If issue IDs are present in context or MCP tools, include links/references.");
+    if (!string.IsNullOrWhiteSpace(argText))
+    {
+        prompt.AppendLine("User refinement:");
+        prompt.AppendLine(argText.Trim());
+    }
+
+    prompt.AppendLine();
+    prompt.AppendLine("Git status:");
+    prompt.AppendLine(statusResult.Value.StdOut);
+    prompt.AppendLine();
+    prompt.AppendLine("Diff:");
+    prompt.AppendLine(TruncateForPrompt(diff, replConfig.MaxDiffCharacters));
+
+    try
+    {
+        var response = await session.SendAndWaitAsync(new MessageOptions { Prompt = prompt.ToString() }, timeout: ResolveRequestTimeout(profile));
+        var content = response?.Data?.Content;
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            WriteError("PR Error: Model returned empty content.");
+            return;
+        }
+
+        AnsiConsole.Write(new Panel(new Markup(Markup.Escape(content)))
+            .Header("[deepskyblue2]PR Draft[/]")
+            .Border(BoxBorder.Rounded)
+            .Expand());
+    }
+    catch (Exception ex)
+    {
+        WriteError($"PR Error: {ex.Message}");
+    }
+}
+
+static async Task HandleReviewCommandAsync(
+    CopilotSession session,
+    ProviderProfile profile,
+    string repoRoot,
+    ReplConfig replConfig,
+    string argText,
+    CancellationToken cancellationToken)
+{
+    var statusResult = await RunGitCommandAsync(repoRoot, cancellationToken, "status", "--short", "--branch");
+    if (statusResult.IsError)
+    {
+        WriteError($"Review Error: {statusResult.FirstError.Description}");
+        return;
+    }
+
+    var stagedDiffResult = await RunGitCommandAsync(repoRoot, cancellationToken, "diff", "--cached", "--");
+    if (stagedDiffResult.IsError)
+    {
+        WriteError($"Review Error: {stagedDiffResult.FirstError.Description}");
+        return;
+    }
+
+    var unstagedDiffResult = await RunGitCommandAsync(repoRoot, cancellationToken, "diff", "--");
+    if (unstagedDiffResult.IsError)
+    {
+        WriteError($"Review Error: {unstagedDiffResult.FirstError.Description}");
+        return;
+    }
+
+    var unifiedDiff = new StringBuilder();
+    if (!string.IsNullOrWhiteSpace(stagedDiffResult.Value.StdOut))
+    {
+        unifiedDiff.AppendLine("[Staged]");
+        unifiedDiff.AppendLine(stagedDiffResult.Value.StdOut);
+    }
+
+    if (!string.IsNullOrWhiteSpace(unstagedDiffResult.Value.StdOut))
+    {
+        unifiedDiff.AppendLine("[Unstaged]");
+        unifiedDiff.AppendLine(unstagedDiffResult.Value.StdOut);
+    }
+
+    var diff = unifiedDiff.ToString();
+    if (string.IsNullOrWhiteSpace(diff))
+    {
+        WriteWarning("No changes available for /review.");
+        return;
+    }
+
+    var prompt = new StringBuilder();
+    prompt.AppendLine("Review the current repository changes.");
+    prompt.AppendLine("Return markdown sections: What Changed, Risk Hotspots, Missing Tests, Rollback Notes.");
+    if (!string.IsNullOrWhiteSpace(argText))
+    {
+        prompt.AppendLine("Extra focus requested by user:");
+        prompt.AppendLine(argText.Trim());
+    }
+
+    prompt.AppendLine();
+    prompt.AppendLine("Git status:");
+    prompt.AppendLine(statusResult.Value.StdOut);
+    prompt.AppendLine();
+    prompt.AppendLine("Diff:");
+    prompt.AppendLine(TruncateForPrompt(diff, replConfig.MaxDiffCharacters));
+
+    try
+    {
+        var response = await session.SendAndWaitAsync(new MessageOptions { Prompt = prompt.ToString() }, timeout: ResolveRequestTimeout(profile));
+        var content = response?.Data?.Content;
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            WriteError("Review Error: Model returned empty content.");
+            return;
+        }
+
+        AnsiConsole.Write(new Panel(new Markup(Markup.Escape(content)))
+            .Header("[deepskyblue2]Review Notes[/]")
+            .Border(BoxBorder.Rounded)
+            .Expand());
+    }
+    catch (Exception ex)
+    {
+        WriteError($"Review Error: {ex.Message}");
+    }
+}
+
+static async Task<ErrorOr<string>> RefineCommitMessageAsync(
+    CopilotSession session,
+    ProviderProfile profile,
+    string existingMessage,
+    string instruction,
+    CancellationToken cancellationToken)
+{
+    if (string.IsNullOrWhiteSpace(instruction))
+        return Error.Validation(description: "Usage: /refine <instruction>");
+
+    var prompt = new StringBuilder();
+    prompt.AppendLine("Refine the following commit message.");
+    prompt.AppendLine("Return ONLY the updated commit message text, no markdown fences.");
+    prompt.AppendLine("Current commit message:");
+    prompt.AppendLine(existingMessage);
+    prompt.AppendLine();
+    prompt.AppendLine("Refinement instruction:");
+    prompt.AppendLine(instruction.Trim());
+
+    try
+    {
+        var response = await session.SendAndWaitAsync(new MessageOptions { Prompt = prompt.ToString() }, timeout: ResolveRequestTimeout(profile));
+        var content = response?.Data?.Content;
+        if (string.IsNullOrWhiteSpace(content))
+            return Error.Failure(description: "Model returned empty refinement output.");
+
+        return content.Trim();
+    }
+    catch (OperationCanceledException)
+    {
+        return Error.Failure(description: cancellationToken.IsCancellationRequested ? "Operation canceled by user." : "Refinement timed out.");
+    }
+}
+
+static async Task PrintRecoverySuggestionAsync(
+    CopilotSession session,
+    ProviderProfile profile,
+    string operation,
+    string errorText,
+    CancellationToken cancellationToken)
+{
+    try
+    {
+        var prompt = new StringBuilder();
+        prompt.AppendLine("A git operation failed. Suggest concise remediation steps.");
+        prompt.AppendLine("Return 3-6 bullet points in plain text.");
+        prompt.AppendLine($"Operation: {operation}");
+        prompt.AppendLine($"Error: {errorText}");
+
+        var response = await session.SendAndWaitAsync(new MessageOptions { Prompt = prompt.ToString() }, timeout: ResolveRequestTimeout(profile));
+        var content = response?.Data?.Content;
+        if (string.IsNullOrWhiteSpace(content))
+            return;
+
+        AnsiConsole.Write(new Panel(new Markup(Markup.Escape(content)))
+            .Header("[deepskyblue2]Suggested Recovery[/]")
+            .Border(BoxBorder.Rounded)
+            .Expand());
+    }
+    catch (OperationCanceledException)
+    {
+    }
+    catch
+    {
+    }
+}
+
 /// <summary>
 /// Writes the final generated commit message to a temporary file and executes the git commit command.
 /// </summary>
@@ -1718,7 +2397,8 @@ static string ComputeCommitDiffKey(
     string branch,
     bool amend,
     string? styleHint,
-    GitToolConfig gitConfig)
+    GitToolConfig gitConfig,
+    string quality)
 {
     using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
     AppendHashSegment(hash, status);
@@ -1729,6 +2409,7 @@ static string ComputeCommitDiffKey(
     AppendHashSegment(hash, gitConfig.UseConventionalCommits ? "1" : "0");
     AppendHashSegment(hash, gitConfig.DefaultCommitType);
     AppendHashSegment(hash, gitConfig.CustomTemplate ?? string.Empty);
+    AppendHashSegment(hash, quality);
 
     return Convert.ToHexString(hash.GetHashAndReset());
 }
@@ -1766,9 +2447,10 @@ static void AppendHashSegment(IncrementalHash hash, string value)
 /// <returns>The loaded <see cref="CommitMessageCacheStore"/>, initializing an empty one if parsing faults.</returns>
 static async Task<CommitMessageCacheStore> LoadCommitMessageCacheAsync(string repoRoot, GitToolConfig gitConfig, CancellationToken cancellationToken)
 {
-    var cachePath = Path.IsPathRooted(gitConfig.CommitMessageCacheFile)
-        ? gitConfig.CommitMessageCacheFile
-        : Path.Combine(repoRoot, gitConfig.CommitMessageCacheFile);
+    var cacheFile = ResolveConfiguredFilePath(gitConfig.CommitMessageCacheFile, ".gitcopilot-cache.json");
+    var cachePath = Path.IsPathRooted(cacheFile)
+        ? cacheFile
+        : Path.Combine(repoRoot, cacheFile);
 
     if (!File.Exists(cachePath))
         return new CommitMessageCacheStore(repoRoot, cachePath, new Dictionary<string, CommitMessageCacheEntry>(), false);
@@ -2708,6 +3390,45 @@ public sealed record GitCommandResult(int ExitCode, string StdOut, string StdErr
 /// <param name="Amend">Identifies context variables processing explicitly parsed capacity states matching trailing overrides tracking process bounds matching output string schemas.</param>
 public sealed record CommitMessageCacheEntry(string Message, string CreatedAtUtc, string Branch, bool Amend);
 
+public sealed record CommitAnalysis(string Intent, string Scope, string Risks, string SuggestedActions, string? TicketHint);
+
+public sealed record CommitSchema(string Type, string? Scope, string Summary, string? Body, bool BreakingChange);
+
+public sealed record CommitGenerationResult(string Message, CommitAnalysis? Analysis, CommitSchema? Schema);
+
+public sealed record CommitCommandResult(string Message, string? AnalysisSummary);
+
+public sealed record CommitRequestOptions(string Quality);
+
+public sealed record BranchMemoryEntry(string? PreferredStyleHint, string? LastCommitType, string? LastCommitScope, string LastUpdatedUtc);
+
+public sealed class BranchMemoryStore
+{
+    public BranchMemoryStore(string repoRoot, string memoryFilePath, Dictionary<string, BranchMemoryEntry> entries)
+    {
+        RepoRoot = repoRoot;
+        MemoryFilePath = memoryFilePath;
+        Entries = entries;
+    }
+
+    public string RepoRoot { get; }
+    public string MemoryFilePath { get; }
+    public Dictionary<string, BranchMemoryEntry> Entries { get; }
+}
+
+public sealed class BranchMemoryFile
+{
+    [JsonPropertyName("Entries")]
+    public Dictionary<string, BranchMemoryEntry> Entries { get; init; } = new();
+
+    public BranchMemoryFile() { }
+
+    public BranchMemoryFile(Dictionary<string, BranchMemoryEntry> entries)
+    {
+        Entries = entries;
+    }
+}
+
 /// <summary>
 /// Contains the hydrated mappings of previously executed prompts bounding dictionary payloads identifying explicit cache state boundaries securely modifying capacity arrays isolating bounds identifying repository outputs.
 /// </summary>
@@ -2804,6 +3525,9 @@ public sealed class GitToolConfig
     [JsonPropertyName("CommitMessageCacheFile")]
     public string CommitMessageCacheFile { get; init; } = ".gitcopilot-cache.json";
 
+    [JsonPropertyName("BranchMemoryFile")]
+    public string BranchMemoryFile { get; init; } = ".gitcopilot-memory.json";
+
     /// <summary>Flags default executing loops parsing commands preventing mapping boundaries from mutating array strings determining processes generating variables defining capacity strings safely routing process strings isolating target mappings matching local string tracking mechanisms.</summary>
     [JsonPropertyName("DryRunDefault")]
     public bool DryRunDefault { get; init; } = false;
@@ -2850,6 +3574,9 @@ public sealed partial class GitToolConfigSerializerContext : JsonSerializerConte
 /// <summary>AOT-friendly serialization context parsing <see cref="CommitMessageCacheFile"/> payloads executing string constraints parsing mapping boundary schemas generating caching tracking parameters safely rendering outputs.</summary>
 [JsonSerializable(typeof(CommitMessageCacheFile), GenerationMode = JsonSourceGenerationMode.Metadata)]
 public sealed partial class CommitMessageCacheFileSerializerContext : JsonSerializerContext;
+
+[JsonSerializable(typeof(BranchMemoryFile), GenerationMode = JsonSourceGenerationMode.Metadata)]
+public sealed partial class BranchMemoryFileSerializerContext : JsonSerializerContext;
 
 static partial class RegexExtensions
 {

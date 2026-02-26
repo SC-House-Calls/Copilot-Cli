@@ -3,13 +3,17 @@
 `GitCopilot` is a .NET file-based CLI that combines GitHub Copilot SDK with a git-first REPL workflow for generating commit messages, committing, and optionally pushing.
 
 It supports:
+
 - GitHub-hosted routing (default cloud profile)
 - Local OpenAI-compatible routing (LM Studio, Ollama-compatible gateways, local proxies, etc.)
 - Interactive REPL with commit tooling (`/status`, `/diff`, `/commit`, `/amend`, `/push`, `/undo`)
-- Extended REPL workflows (`/log`, one-shot `/attach <file>`, interactive `/add` selector)
+- Extended REPL workflows (`/log`, one-shot `/attach <file>`, interactive `/add` selector, `/pr`, `/review`, `/refine`)
 - Dry-run simulation mode
 - Local commit-message cache keyed by git diff context
+- Two-stage commit generation (analysis → structured schema → final formatted message)
 - Interactive model picker (`/model`) for OpenAI-compatible profiles
+- Branch/worktree-scoped commit style memory persisted per repository
+- Failure-recovery suggestions for commit/push errors
 - Optional MCP server configuration (global + per-profile merge)
 
 ---
@@ -99,6 +103,7 @@ If this file is missing and you run from inside a git repository, GitCopilot aut
     "CustomTemplate": "{{message}}",
     "EnableCommitMessageCache": true,
     "CommitMessageCacheFile": ".gitcopilot-cache.json",
+    "BranchMemoryFile": ".gitcopilot-memory.json",
     "DryRunDefault": false
   },
   "Repl": {
@@ -112,6 +117,7 @@ If this file is missing and you run from inside a git repository, GitCopilot aut
 ### Key Fields
 
 #### `Profiles`
+
 - `ProviderType`: `GitHub` or `OpenAICompatible`
 - `BaseUrl`: required for OpenAI-compatible profile
 - `ApiKey`: optional for local providers
@@ -121,11 +127,13 @@ If this file is missing and you run from inside a git repository, GitCopilot aut
 - `McpServers`: optional per-profile MCP servers (merged over global MCP servers)
 
 #### `McpServers` (root-level)
+
 - Global MCP server map applied to all profiles
 - Profiles may override/add servers with the same server key
 - Each server supports `Url` (HTTP endpoint) or `Command` + optional `Args` and `Env`
 
 #### `Git`
+
 - `AutoPush`: auto-run push after successful commit/amend
 - `RequireConfirmations`: prompt before mutating operations
 - `ProtectedBranches`: deny push to these branches
@@ -134,9 +142,11 @@ If this file is missing and you run from inside a git repository, GitCopilot aut
 - `CustomTemplate`: optional template; supports `{{message}}`, `{{branch}}`, `{{date}}`
 - `EnableCommitMessageCache`: enable diff-based message cache
 - `CommitMessageCacheFile`: cache file path (relative to repo root unless absolute)
+- `BranchMemoryFile`: branch/worktree style-memory file path (relative to repo root unless absolute)
 - `DryRunDefault`: start REPL in dry-run mode
 
 #### `Repl`
+
 - `Prompt`: custom REPL prompt
 - `MaxDiffCharacters`: diff truncation limit for model prompt payload
 - `MaxAttachmentCharacters`: max size for one-shot `/attach` file context
@@ -148,14 +158,16 @@ If this file is missing and you run from inside a git repository, GitCopilot aut
 - `/help` — show command help
 - `/status` — `git status --short --branch`
 - `/diff [--staged|--unstaged]` — show diff (defaults to staged if present)
-- `/add [paths]` — stage files (default `.`)
 - `/add [paths]` — stage files; when omitted opens interactive file picker
 - `/reset [paths]` — unstage files (default `.`)
-- `/commit` — generate commit message and commit staged changes
-- `/amend` — generate message and amend latest commit
+- `/commit [--quality fast|high]` — generate commit message and commit staged changes
+- `/amend [--quality fast|high]` — generate message and amend latest commit
 - `/push [remote] [branch]` — push with policy checks
 - `/log [count]` — show recent commits (default 10)
 - `/attach <file>|clear` — attach one-shot context file for next `/commit` or `/amend`
+- `/pr` — generate PR title, summary, checklist, testing notes, and linked-work hints
+- `/review` — generate review output (`What Changed`, `Risk Hotspots`, `Missing Tests`, `Rollback Notes`)
+- `/refine <instruction>` — refine the last generated commit message conversationally
 - `/model` — list available models and pick active one (OpenAI-compatible profiles)
 - `/dry-run [on|off|toggle]` — toggle/force simulation mode for mutating commands
 - `/cache [stats|clear]` — cache diagnostics or clear cache
@@ -195,6 +207,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-gitcopilot.ps1 -Aot -
 ```
 
 This script:
+
 - runs `dotnet build -c Release`
 - publishes release output
 - optionally publishes AOT (`-Aot`) with fallback to standard Release publish unless `-ForceAot` is set
@@ -230,6 +243,7 @@ bash ./scripts/install-gitcopilot.sh --install-root "$HOME/.local/share/gitcopil
 ```
 
 This script:
+
 - runs `dotnet build -c Release`
 - publishes release output
 - optionally publishes AOT (`--aot`) with fallback to standard Release publish unless `--force-aot` is set
@@ -248,9 +262,14 @@ This script:
 - Commit generation cache prevents duplicate generation for identical context.
 - On first cache write, GitCopilot checks `.gitignore` and auto-adds the cache file path if missing.
 - Cache metadata stores a one-time `GitIgnoreCheckCompleted` marker to skip repeated `.gitignore` checks on future runs.
+- Commit generation uses a two-stage pipeline (analysis then structured commit schema) with one repair attempt before plain-text fallback.
+- `/commit --quality high` and `/amend --quality high` request a higher-quality generation path; default is `fast`.
+- Branch/worktree-scoped style memory is persisted in `Git.BranchMemoryFile` and reused when no inline style hint is provided.
 - `/model` updates active model for the current REPL session by recreating the underlying SDK session.
 - `/attach` context is one-shot: it is applied to the next `/commit` or `/amend`, then cleared.
 - `/add` without explicit paths opens a multi-select file picker for unstaged files.
+- `/refine` updates the last generated commit message without recomputing the full git diff context.
+- If `git commit` or `git push` fails, GitCopilot asks the model for concise remediation suggestions.
 - REPL enforces repository-root execution for safer and more predictable git behavior.
 
 ---
@@ -258,22 +277,27 @@ This script:
 ## Troubleshooting
 
 ### "Current directory is not a git repository"
+
 Run the tool from repository root.
 
 ### "No model configured or discoverable"
+
 - Ensure provider `BaseUrl` is correct
 - Ensure endpoint supports `GET /models`
 - Set explicit profile `Model` in config
 
 ### NativeAOT install fails (Windows)
+
 - Install NativeAOT prerequisites (especially Visual Studio "Desktop development with C++").
 - Retry AOT install, or use non-AOT install mode.
 - Installer fallback now forces non-AOT publish settings when AOT fails (unless strict AOT mode is requested).
 
 ### Push blocked on protected branch
+
 Adjust `Git.ProtectedBranches` in config if intentional.
 
 ### PATH changes not recognized
+
 Open a new terminal session (or source your shell profile).
 
 ---

@@ -1,0 +1,44 @@
+{
+    "Profiles": {
+        "cloud": {
+            "ProviderType": "GitHub",
+            "BaseUrl": null,
+            "ApiKey": null,
+            "Model": null,
+            "RequestTimeoutSeconds": 60,
+            "ModelDiscoveryTimeoutSeconds": null,
+            "McpServers": null
+        },
+        "lmstudio": {
+            "ProviderType": "OpenAICompatible",
+            "BaseUrl": "http://localhost:1234/v1",
+            "ApiKey": "lm-studio",
+            "Model": "openai/gpt-oss-20b",
+            "RequestTimeoutSeconds": 300,
+            "ModelDiscoveryTimeoutSeconds": 30,
+            "McpServers": null
+        }
+    },
+    "DefaultProfile": "lmstudio",
+    "Git": {
+        "AutoPush": false,
+        "RequireConfirmations": true,
+        "ProtectedBranches": [
+            "main",
+            "master"
+        ],
+        "UseConventionalCommits": true,
+        "DefaultCommitType": "chore",
+        "CustomTemplate": null,
+        "EnableCommitMessageCache": true,
+        "CommitMessageCacheFile": ".gitcopilot-cache.json",
+        "BranchMemoryFile": ".gitcopilot-memory.json",
+        "DryRunDefault": false
+    },
+    "Repl": {
+        "Prompt": "gitcopilot\u003E ",
+        "MaxDiffCharacters": 12000,
+        "MaxAttachmentCharacters": 8000
+    },
+    "McpServers": null
+}
