@@ -1,0 +1,34 @@
+{
+  "Profiles": {
+    "cloud": {
+      "ProviderType": "GitHub"
+    },
+    "lmstudio": {
+      "ProviderType": "OpenAICompatible",
+      "BaseUrl": "http://localhost:1234/v1",
+      "ApiKey": "lm-studio",
+      "Model": "openai/gpt-oss-20b"
+    },
+    "foundry": {
+      "ProviderType": "OpenAICompatible",
+      "BaseUrl": "http://localhost:8080/v1",
+      "ApiKey": "foundry-local"
+    }
+  },
+  "DefaultProfile": "cloud",
+  "Git": {
+    "AutoPush": false,
+    "RequireConfirmations": true,
+    "ProtectedBranches": ["main", "master"],
+    "UseConventionalCommits": true,
+    "DefaultCommitType": "chore",
+    "CustomTemplate": "{{message}}",
+    "EnableCommitMessageCache": true,
+    "CommitMessageCacheFile": ".gitcopilot-cache.json",
+    "DryRunDefault": false
+  },
+  "Repl": {
+    "Prompt": "gitcopilot> ",
+    "MaxDiffCharacters": 12000
+  }
+}
